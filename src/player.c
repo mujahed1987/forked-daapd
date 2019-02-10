@@ -281,6 +281,8 @@ playback_abort(void);
 static void
 playback_suspend(void);
 
+static int
+player_get_current_pos(uint64_t *pos, struct timespec *ts, int commit);
 
 /* ----------------------------- Volume helpers ----------------------------- */
 
@@ -1003,7 +1005,7 @@ source_switch(int nbytes)
 }
 
 static void
-session_init(struct player_session *session, struct media_quality *quality)
+session_reset(struct player_session *session, struct media_quality *quality)
 {
   session->samples_written = 0;
   session->quality = *quality;
@@ -1027,7 +1029,7 @@ session_init(struct player_session *session, struct media_quality *quality)
 }
 
 static void
-session_deinit(struct player_session *session)
+session_clear(struct player_session *session)
 {
   free(session->buffer);
   memset(session, 0, sizeof(struct player_session));
@@ -1077,7 +1079,9 @@ source_read(uint8_t *buf, int len)
   else if (flags & INPUT_FLAG_QUALITY)
     {
       input_quality_get(&quality);
-      session_init(&pb_session, &quality);
+
+      if (!quality_is_equal(&quality, &pb_session.quality))
+	session_reset(&pb_session, &quality);
     }
 
   // We pad the output buffer with silence if we don't have enough data for a
@@ -1165,7 +1169,7 @@ playback_cb(int fd, short what, void *arg)
 	}
 
       nsamples = BTOS(got, pb_session.quality.bits_per_sample, pb_session.quality.channels);
-      outputs_write2(pb_session.buffer, pb_session.bufsize, &pb_session.quality, nsamples, &pb_session.pts);
+      outputs_write(pb_session.buffer, pb_session.bufsize, &pb_session.quality, nsamples, &pb_session.pts);
       pb_session.samples_written += nsamples;
 
       if (got < pb_session.bufsize)
@@ -1462,11 +1466,11 @@ device_metadata_send(void *arg, int *retval)
 /* -------- Output device callbacks executed in the player thread ----------- */
 
 static void
-device_streaming_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
+device_streaming_cb(struct output_device *device, enum output_device_state status)
 {
   int ret;
 
-  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_streaming_cb\n", outputs_name(device->type));
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_streaming_cb (status %d)\n", outputs_name(device->type), status);
 
   ret = device_check(device);
   if (ret < 0)
@@ -1486,8 +1490,6 @@ device_streaming_cb(struct output_device *device, struct output_session *session
       if (player_state == PLAY_PLAYING)
 	speaker_deselect_output(device);
 
-      device->session = NULL;
-
       if (!device->advertised)
 	device_remove(device);
 
@@ -1500,24 +1502,22 @@ device_streaming_cb(struct output_device *device, struct output_session *session
 
       output_sessions--;
 
-      device->session = NULL;
-
       if (!device->advertised)
 	device_remove(device);
     }
   else
-    outputs_status_cb(session, device_streaming_cb);
+    outputs_device_set_cb(device, device_streaming_cb);
 }
 
 static void
-device_command_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
+device_command_cb(struct output_device *device, enum output_device_state status)
 {
-  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_command_cb\n", outputs_name(device->type));
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_command_cb (status %d)\n", outputs_name(device->type), status);
 
-  outputs_status_cb(session, device_streaming_cb);
+  outputs_device_set_cb(device, device_streaming_cb);
 
   if (status == OUTPUT_STATE_FAILED)
-    device_streaming_cb(device, session, status);
+    device_streaming_cb(device, status);
 
   // Used by playback_suspend - is basically the bottom half
   if (player_flush_pending > 0)
@@ -1531,12 +1531,12 @@ device_command_cb(struct output_device *device, struct output_session *session, 
 }
 
 static void
-device_shutdown_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
+device_shutdown_cb(struct output_device *device, enum output_device_state status)
 {
   int retval;
   int ret;
 
-  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_shutdown_cb\n", outputs_name(device->type));
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_shutdown_cb (status %d)\n", outputs_name(device->type), status);
 
   if (output_sessions)
     output_sessions--;
@@ -1552,8 +1552,6 @@ device_shutdown_cb(struct output_device *device, struct output_session *session,
       goto out;
     }
 
-  device->session = NULL;
-
   if (!device->advertised)
     device_remove(device);
 
@@ -1566,9 +1564,9 @@ device_shutdown_cb(struct output_device *device, struct output_session *session,
 }
 
 static void
-device_lost_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
+device_lost_cb(struct output_device *device, enum output_device_state status)
 {
-  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_lost_cb\n", outputs_name(device->type));
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_lost_cb (status %d)\n", outputs_name(device->type), status);
 
   // We lost that device during startup for some reason, not much we can do here
   if (status == OUTPUT_STATE_FAILED)
@@ -1578,12 +1576,12 @@ device_lost_cb(struct output_device *device, struct output_session *session, enu
 }
 
 static void
-device_activate_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
+device_activate_cb(struct output_device *device, enum output_device_state status)
 {
   int retval;
   int ret;
 
-  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_activate_cb\n", outputs_name(device->type));
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_activate_cb (status %d)\n", outputs_name(device->type), status);
 
   retval = commands_exec_returnvalue(cmdbase);
   ret = device_check(device);
@@ -1591,8 +1589,7 @@ device_activate_cb(struct output_device *device, struct output_session *session,
     {
       DPRINTF(E_WARN, L_PLAYER, "Output device disappeared during startup!\n");
 
-      outputs_status_cb(session, device_lost_cb);
-      outputs_device_stop(session);
+      outputs_device_stop(device, device_lost_cb);
 
       if (retval != -2)
 	retval = -1;
@@ -1617,11 +1614,9 @@ device_activate_cb(struct output_device *device, struct output_session *session,
       goto out;
     }
 
-  device->session = session;
-
   output_sessions++;
 
-  outputs_status_cb(session, device_streaming_cb);
+  outputs_device_set_cb(device, device_streaming_cb);
 
  out:
   /* cur_cmd->ret already set
@@ -1633,12 +1628,12 @@ device_activate_cb(struct output_device *device, struct output_session *session,
 }
 
 static void
-device_probe_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
+device_probe_cb(struct output_device *device, enum output_device_state status)
 {
   int retval;
   int ret;
 
-  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_probe_cb\n", outputs_name(device->type));
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_probe_cb (status %d)\n", outputs_name(device->type), status);
 
   retval = commands_exec_returnvalue(cmdbase);
   ret = device_check(device);
@@ -1679,12 +1674,12 @@ device_probe_cb(struct output_device *device, struct output_session *session, en
 }
 
 static void
-device_restart_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
+device_restart_cb(struct output_device *device, enum output_device_state status)
 {
   int retval;
   int ret;
 
-  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_restart_cb\n", outputs_name(device->type));
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_restart_cb (status %d)\n", outputs_name(device->type), status);
 
   retval = commands_exec_returnvalue(cmdbase);
   ret = device_check(device);
@@ -1692,8 +1687,7 @@ device_restart_cb(struct output_device *device, struct output_session *session, 
     {
       DPRINTF(E_WARN, L_PLAYER, "Output device disappeared during restart!\n");
 
-      outputs_status_cb(session, device_lost_cb);
-      outputs_device_stop(session);
+      outputs_device_stop(device, device_lost_cb);
 
       if (retval != -2)
 	retval = -1;
@@ -1718,10 +1712,8 @@ device_restart_cb(struct output_device *device, struct output_session *session, 
       goto out;
     }
 
-  device->session = session;
-
   output_sessions++;
-  outputs_status_cb(session, device_streaming_cb);
+  outputs_device_set_cb(device, device_streaming_cb);
 
  out:
   commands_exec_end(cmdbase, retval);
@@ -1780,11 +1772,22 @@ playback_timer_stop(void)
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_PLAYER, "Could not disarm playback timer: %s\n", strerror(errno));
-
       return -1;
     }
 
   return 0;
+}
+
+static int
+pb_session_stop(void)
+{
+  int ret;
+
+  ret = playback_timer_stop();
+
+  session_clear(&pb_session);
+
+  return ret;
 }
 
 static void
@@ -1792,7 +1795,7 @@ playback_abort(void)
 {
   outputs_playback_stop();
 
-  playback_timer_stop();
+  pb_session_stop();
 
   source_stop();
 
@@ -1809,9 +1812,9 @@ playback_abort(void)
 static void
 playback_suspend(void)
 {
-  player_flush_pending = outputs_flush2(device_command_cb);
+  player_flush_pending = outputs_flush(device_command_cb);
 
-  playback_timer_stop();
+  pb_session_stop();
 
   status_update(PLAY_PAUSED);
 
@@ -1943,9 +1946,9 @@ playback_stop(void *arg, int *retval)
 
   // We may be restarting very soon, so we don't bring the devices to a full
   // stop just yet; this saves time when restarting, which is nicer for the user
-  *retval = outputs_flush2(device_command_cb);
+  *retval = outputs_flush(device_command_cb);
 
-  playback_timer_stop();
+  pb_session_stop();
 
   ps_playing = source_now_playing();
   if (ps_playing)
@@ -1969,7 +1972,6 @@ playback_stop(void *arg, int *retval)
 static enum command_state
 playback_start_bh(void *arg, int *retval)
 {
-  struct timespec ts;
   int ret;
 
   // initialize the packet timer to the same relative time that we have 
@@ -1982,10 +1984,6 @@ playback_start_bh(void *arg, int *retval)
 
 //  pb_buffer_offset = 0;
   pb_read_deficit = 0;
-
-  ret = clock_gettime_with_res(CLOCK_MONOTONIC, &ts, &player_timer_res);
-  if (ret < 0)
-    goto out_fail;
 
   ret = playback_timer_start();
   if (ret < 0)
@@ -2092,7 +2090,7 @@ playback_start_item(void *arg, int *retval)
     {
       if (device->selected && !device->session)
 	{
-	  ret = outputs_device_start2(device, device_restart_cb);
+	  ret = outputs_device_start(device, device_restart_cb);
 	  if (ret < 0)
 	    {
 	      DPRINTF(E_LOG, L_PLAYER, "Could not start selected %s device '%s'\n", device->type_name, device->name);
@@ -2112,7 +2110,7 @@ playback_start_item(void *arg, int *retval)
 	  continue;
 
 	speaker_select_output(device);
-	ret = outputs_device_start(device, device_restart_cb, TEMP_NEXT_RTPTIME);
+	ret = outputs_device_start(device, device_restart_cb);
 	if (ret < 0)
 	  {
 	    DPRINTF(E_DBG, L_PLAYER, "Could not autoselect %s device '%s'\n", device->type_name, device->name);
@@ -2414,9 +2412,9 @@ playback_pause(void *arg, int *retval)
       return COMMAND_END;
     }
 
-  *retval = outputs_flush2(device_command_cb);
+  *retval = outputs_flush(device_command_cb);
 
-  playback_timer_stop();
+  pb_session_stop();
 
   source_pause(pos);
 
@@ -2494,7 +2492,7 @@ speaker_activate(struct output_device *device)
     {
       DPRINTF(E_DBG, L_PLAYER, "Activating %s device '%s'\n", device->type_name, device->name);
 
-      ret = outputs_device_start2(device, device_activate_cb);
+      ret = outputs_device_start(device, device_activate_cb);
       if (ret < 0)
 	{
 	  DPRINTF(E_LOG, L_PLAYER, "Could not start %s device '%s'\n", device->type_name, device->name);
@@ -2532,8 +2530,7 @@ speaker_deactivate(struct output_device *device)
   if (!device->session)
     return 0;
 
-  outputs_status_cb(device->session, device_shutdown_cb);
-  outputs_device_stop(device->session);
+  outputs_device_stop(device, device_shutdown_cb);
   return 1;
 }
 
@@ -2960,7 +2957,8 @@ playerqueue_plid(void *arg, int *retval)
 
 /* ------------------------------- Player API ------------------------------- */
 
-int
+// TODO no longer part of API
+static int
 player_get_current_pos(uint64_t *pos, struct timespec *ts, int commit)
 {
   uint64_t delta;
@@ -2998,21 +2996,6 @@ player_get_current_pos(uint64_t *pos, struct timespec *ts, int commit)
 #ifdef DEBUG_SYNC
       DPRINTF(E_DBG, L_PLAYER, "Pos: %" PRIu64 " (clock)\n", *pos);
 #endif
-    }
-
-  return 0;
-}
-
-int
-player_get_time(struct timespec *ts)
-{
-  int ret;
-
-  ret = clock_gettime_with_res(CLOCK_MONOTONIC, ts, &player_timer_res);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Couldn't get clock: %s\n", strerror(errno));
-      return -1;
     }
 
   return 0;
@@ -3442,7 +3425,6 @@ player(void *arg)
 int
 player_init(void)
 {
-  struct media_quality default_quality = { 44100, 16, 2 };
   uint64_t interval;
   uint32_t rnd;
   int ret;
@@ -3518,8 +3500,6 @@ player_init(void)
       goto evnew_fail;
     }
 
-  session_init(&pb_session, &default_quality);
-
   cmdbase = commands_base_new(evbase_player, NULL);
 
   ret = outputs_init();
@@ -3556,7 +3536,6 @@ player_init(void)
   outputs_deinit();
  outputs_fail:
   commands_base_free(cmdbase);
-  session_deinit(&pb_session);
  evnew_fail:
   event_base_free(evbase_player);
  evbase_fail:
@@ -3589,7 +3568,7 @@ player_deinit(void)
   player_exit = 1;
   commands_base_destroy(cmdbase);
 
-  session_deinit(&pb_session);
+  session_clear(&pb_session);
 
   ret = pthread_join(tid_player, NULL);
   if (ret != 0)
